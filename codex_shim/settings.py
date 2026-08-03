@@ -48,7 +48,7 @@ def chatgpt_passthrough_available(auth_path: Path | None = None) -> bool:
     if not expanded.exists():
         return False
     try:
-        data = json.loads(expanded.read_text())
+        data = json.loads(expanded.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     tokens = data.get("tokens") if isinstance(data, dict) else None
@@ -118,7 +118,7 @@ def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> l
     path = Path(cache_path or DEFAULT_CODEX_MODELS_CACHE).expanduser()
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = None
         if isinstance(data, dict):
@@ -211,7 +211,7 @@ class ModelSettings:
             if self.path == DEFAULT_SETTINGS:
                 return []
             raise FileNotFoundError(self.path)
-        data = json.loads(self.path.read_text())
+        data = json.loads(self.path.read_text(encoding="utf-8"))
         rows = _model_rows(data)
         model_counts: dict[str, int] = {}
         for row in rows:
@@ -361,7 +361,7 @@ def _resolve_api_key(value: str) -> str:
         raw = os.environ.get(raw[2:-1].strip(), "")
     if not raw and DEFAULT_CURSOR_API_KEY_FILE.exists():
         try:
-            raw = DEFAULT_CURSOR_API_KEY_FILE.read_text().strip()
+            raw = DEFAULT_CURSOR_API_KEY_FILE.read_text(encoding="utf-8").strip()
         except OSError:
             raw = ""
     if not raw:

@@ -111,7 +111,7 @@ def load_router_config(settings_path: Path | str) -> Optional[RouterConfig]:
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):

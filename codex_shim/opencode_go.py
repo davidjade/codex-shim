@@ -152,7 +152,7 @@ def write_opencode_go_models(settings_path: Path, rows: list[dict[str, Any]], *,
     preserved = [row for row in _settings_rows(existing) if not _is_opencode_go_row(row, base_url)]
     payload[target] = [*preserved, *rows]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def display_name_from_model_id(model_id: str) -> str:
@@ -214,7 +214,7 @@ def _read_settings_json(path: Path) -> Any:
     if not expanded.exists():
         return {}
     try:
-        return json.loads(expanded.read_text())
+        return json.loads(expanded.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Settings file is not valid JSON: {expanded}: {exc}") from exc
 

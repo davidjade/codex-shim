@@ -21,6 +21,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - `docs/subscription-integration.md`, covering ChatGPT/Codex and
   Cursor/Composer subscription passthrough setup, troubleshooting, limitations,
   and privacy notes.
+
 - Auto Router (`codex_shim/router.py`): an optional `Auto (smart routing)` picker
   entry (slug `codex-auto`) that routes each task to the cheapest configured
   model that can handle it. A cheap classifier model scores every candidate
@@ -91,6 +92,8 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Read and write shim JSON, TOML, catalog, manifest, and runtime text as UTF-8
+  explicitly so native Windows does not decode Codex files with `cp1252`.
 - Protected the state-changing picker `/api/switch` endpoint with a
   per-process picker token so third-party pages cannot trigger model switches
   or Desktop restarts through the loopback server.

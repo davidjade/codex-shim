@@ -376,7 +376,7 @@ def _doctor_runtime_files() -> list[DoctorCheck]:
     if CATALOG_PATH.exists():
         checks.append(DoctorCheck("Runtime files", "OK", f"catalog: {CATALOG_PATH}"))
         try:
-            data = json.loads(CATALOG_PATH.read_text())
+            data = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
             models = data.get("models", []) if isinstance(data, dict) else []
             count = len(models) if isinstance(models, list) else 0
             checks.append(DoctorCheck("Runtime files", "OK", f"catalog models: {count}"))
@@ -507,7 +507,7 @@ def _doctor_codex_config() -> list[DoctorCheck]:
         ]
     checks = [DoctorCheck("Codex config", "OK", f"config exists: {path}")]
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         return [DoctorCheck("Codex config", "WARN", f"could not read config: {path}", str(exc))]
     provider_configured = (
@@ -608,7 +608,7 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
     default_slug = _resolve_model_slug(models, model_slug, router_config)
     CODEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    original = CODEX_CONFIG_PATH.read_text() if CODEX_CONFIG_PATH.exists() else ""
+    original = CODEX_CONFIG_PATH.read_text(encoding="utf-8") if CODEX_CONFIG_PATH.exists() else ""
     cleaned = _remove_managed_config(original)
     current_top_level = _extract_top_level_key_lines(cleaned, MANAGED_TOP_LEVEL_KEYS)
     if current_top_level:
@@ -616,14 +616,18 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
     else:
         previous_top_level = _managed_previous_top_level(original)
     if not previous_top_level and CODEX_CONFIG_BACKUP_PATH.exists():
-        previous_top_level = _extract_top_level_key_lines(CODEX_CONFIG_BACKUP_PATH.read_text(), MANAGED_TOP_LEVEL_KEYS)
+        previous_top_level = _extract_top_level_key_lines(
+            CODEX_CONFIG_BACKUP_PATH.read_text(encoding="utf-8"), MANAGED_TOP_LEVEL_KEYS
+        )
     cleaned = _remove_top_level_keys(cleaned, MANAGED_TOP_LEVEL_KEYS)
     cleaned = _remove_section(cleaned, f"model_providers.{PROVIDER_NAME}")
     provider_name = _provider_display_name(models, default_slug, router_config)
     top_block, provider_block = _managed_config_blocks(
         default_slug, port, previous_top_level, provider_name=provider_name
     )
-    CODEX_CONFIG_PATH.write_text(top_block + "\n" + cleaned.lstrip() + "\n" + provider_block)
+    CODEX_CONFIG_PATH.write_text(
+        top_block + "\n" + cleaned.lstrip() + "\n" + provider_block, encoding="utf-8"
+    )
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
 
 
@@ -676,7 +680,7 @@ def start(settings_path: Path, port: int) -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     process = _popen_daemon(cmd, log, env)
-    PID_PATH.write_text(str(process.pid))
+    PID_PATH.write_text(str(process.pid), encoding="utf-8")
     for _ in range(50):
         if _healthy(port):
             print(f"Shim started on http://{DEFAULT_HOST}:{port} with pid {process.pid}.")
@@ -709,14 +713,16 @@ def stop() -> int:
 
 def restore_codex_config() -> None:
     if CODEX_CONFIG_PATH.exists():
-        current = CODEX_CONFIG_PATH.read_text()
+        current = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
         previous_top_level = _managed_previous_top_level(current)
         if not previous_top_level and CODEX_CONFIG_BACKUP_PATH.exists():
-            previous_top_level = _extract_top_level_key_lines(CODEX_CONFIG_BACKUP_PATH.read_text(), MANAGED_TOP_LEVEL_KEYS)
+            previous_top_level = _extract_top_level_key_lines(
+                CODEX_CONFIG_BACKUP_PATH.read_text(encoding="utf-8"), MANAGED_TOP_LEVEL_KEYS
+            )
         restored = _remove_managed_config(current)
         restored = _remove_section(restored, f"model_providers.{PROVIDER_NAME}")
         restored = _restore_missing_top_level_keys(restored.lstrip(), previous_top_level)
-        CODEX_CONFIG_PATH.write_text(restored)
+        CODEX_CONFIG_PATH.write_text(restored, encoding="utf-8")
         print(f"Removed shim config from {CODEX_CONFIG_PATH}.")
     if CODEX_CONFIG_BACKUP_PATH.exists():
         CODEX_CONFIG_BACKUP_PATH.unlink()
@@ -904,7 +910,7 @@ def discover_vscode_extensions() -> list[VSCodeExtension]:
 def _inspect_vscode_extension(path: Path, location: str = "Explicit") -> VSCodeExtension | None:
     manifest_path = path / "package.json"
     try:
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if manifest.get("publisher") != "openai" or manifest.get("name") != "chatgpt":
@@ -1085,7 +1091,7 @@ def _write_vscode_backup(
         "patched_at": datetime.now(timezone.utc).isoformat(),
     }
     if not manifest_path.exists():
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return backup_dir
 
 
@@ -1111,7 +1117,7 @@ def _restore_vscode_extension(extension: VSCodeExtension) -> bool:
     backup_root = RUNTIME_DIR / VSCODE_BACKUP_DIR_NAME
     for manifest_path in backup_root.glob("*/manifest.json") if backup_root.exists() else []:
         try:
-            manifest = json.loads(manifest_path.read_text())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         if manifest.get("extension_path") == str(extension.path.resolve()):
@@ -1249,15 +1255,15 @@ def _replace_once(
         return None
     if len(matches) != 1:
         return None
-    path.write_text(needle.sub(replacement, text, count=1))
+    path.write_text(needle.sub(replacement, text, count=1), encoding="utf-8")
     return True
 
 
 def _read_text_lossy(path: Path) -> str:
     try:
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        return path.read_text(errors="ignore")
+        return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def patched_codex_app_bundle() -> Path | None:
@@ -1574,7 +1580,7 @@ def _current_managed_model() -> str | None:
     if not CODEX_CONFIG_PATH.exists():
         return None
     in_managed = False
-    for line in CODEX_CONFIG_PATH.read_text().splitlines():
+    for line in CODEX_CONFIG_PATH.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped == MANAGED_BEGIN:
             in_managed = True
@@ -1614,7 +1620,7 @@ def _health(port: int) -> dict | None:
 
 def _read_pid() -> int | None:
     try:
-        return int(PID_PATH.read_text().strip())
+        return int(PID_PATH.read_text(encoding="utf-8").strip())
     except Exception:
         return None
 

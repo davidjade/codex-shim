@@ -10,7 +10,12 @@ import pytest
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
 from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
-from codex_shim.settings import ModelSettings, chatgpt_passthrough_available, FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
+from codex_shim.settings import (
+    FALLBACK_CHATGPT_PASSTHROUGH_SLUGS,
+    ModelSettings,
+    chatgpt_passthrough_available,
+    load_chatgpt_passthrough_catalog_models,
+)
 
 
 @pytest.fixture
@@ -466,6 +471,24 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
     assert [model["slug"] for model in data["models"]] == list(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+
+
+def test_codex_models_cache_is_read_as_utf8_on_windows_codepages(tmp_path):
+    cache = tmp_path / "models_cache.json"
+    display_name = "GPT ”Unicode”"
+    raw = json.dumps(
+        {"models": [{"slug": "gpt-unicode", "display_name": display_name}]},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    # U+201D ends in byte 0x9d in UTF-8; that byte is undefined in cp1252,
+    # reproducing the native-Windows traceback when no encoding is specified.
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("cp1252")
+    cache.write_bytes(raw)
+
+    models = load_chatgpt_passthrough_catalog_models(cache)
+
+    assert models[0]["display_name"] == display_name
 
 
 def test_write_catalog_explicit_model_replaces_automatic_passthrough_slug(

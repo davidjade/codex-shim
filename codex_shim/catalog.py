@@ -148,7 +148,7 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None) -> Pa
         else:
             entries[existing] = entry
     payload = {"models": entries}
-    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     return path
 
 
@@ -172,7 +172,7 @@ request_max_retries = 3
 stream_max_retries = 3
 stream_idle_timeout_ms = 600000
 '''
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8")
     return path
 
 

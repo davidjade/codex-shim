@@ -500,7 +500,7 @@ class ShimServer:
         """
         auth_path = DEFAULT_CODEX_AUTH.expanduser()
         try:
-            auth = json.loads(auth_path.read_text())
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
         tokens = auth.get("tokens") or {}
@@ -564,7 +564,7 @@ class ShimServer:
     ) -> web.StreamResponse:
         auth_path = DEFAULT_CODEX_AUTH.expanduser()
         try:
-            auth = json.loads(auth_path.read_text())
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
         tokens = auth.get("tokens") or {}
@@ -2376,9 +2376,9 @@ def _dump_debug_request(slug: str, url: str, body: dict[str, Any]) -> None:
                 "tool_count": len(body.get("tools") or []),
                 "last_3_messages": messages[-3:],
             }
-            dump_path.write_text(json.dumps(summary, indent=2, default=str))
+            dump_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
         else:
-            dump_path.write_text(full)
+            dump_path.write_text(full, encoding="utf-8")
     except OSError as exc:
         print(f"[debug] dump failed: {exc}", flush=True)
 
@@ -2388,7 +2388,7 @@ def _current_managed_model() -> str | None:
     if not CODEX_CONFIG_PATH.exists():
         return None
     try:
-        text = CODEX_CONFIG_PATH.read_text()
+        text = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
     except OSError:
         return None
     for line in text.splitlines():
@@ -2410,14 +2410,14 @@ def _set_active_model(slug: str, display_name: str | None = None) -> None:
     if not CODEX_CONFIG_PATH.exists():
         return
     try:
-        text = CODEX_CONFIG_PATH.read_text()
+        text = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
     except OSError:
         return
     text = _MODEL_LINE_RE.sub(rf'\g<1>{slug}\g<2>', text, count=1)
     if display_name:
         text = _PROVIDER_NAME_RE.sub(rf'\g<1>{display_name}\g<2>', text, count=1)
     try:
-        CODEX_CONFIG_PATH.write_text(text)
+        CODEX_CONFIG_PATH.write_text(text, encoding="utf-8")
     except OSError as exc:
         print(f"[switch] failed to write {CODEX_CONFIG_PATH}: {exc}", flush=True)
         return
