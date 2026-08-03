@@ -7,9 +7,9 @@ subscription's Codex model** — without rebuilding Codex.
 The shim is a local Python/aiohttp server that exposes an OpenAI
 Responses-compatible endpoint on loopback. Codex points at the shim; the shim
 routes each request to the matching upstream (OpenAI chat completions,
-Anthropic Messages, a generic OpenAI-shaped chat endpoint, or ChatGPT Codex
-passthrough), then translates streaming responses back into the shape Codex
-expects.
+Anthropic Messages, a generic OpenAI-shaped chat or native Responses endpoint,
+or ChatGPT Codex passthrough), then translates when necessary and returns the
+shape Codex expects.
 
 > Tested on Codex Desktop **0.133.0-alpha.1** for macOS arm64. The shim server
 > and routing layer are plain Python/aiohttp and work on Windows, macOS, Linux,
@@ -252,9 +252,11 @@ block can be removed with:
 codex-shim disable
 ```
 
-After this, Codex Desktop sees every entry from `~/.codex-shim/models.json`,
-plus the `GPT-5.5` ChatGPT passthrough slug if (and only if) `~/.codex/auth.json`
-holds a valid `tokens.access_token`.
+After this, Codex Desktop sees one combined catalog: every usable entry from
+`~/.codex-shim/models.json`, every model currently discovered from ChatGPT
+passthrough when `~/.codex/auth.json` holds a valid `tokens.access_token`, the
+Cursor passthrough entry when available, and the Auto Router entry when it is
+configured and active.
 
 If your Codex Desktop's model picker only shows `default` and refuses to render
 the catalog entries, apply the macOS picker patch below.
@@ -284,8 +286,9 @@ codex-shim codex -- "inspect this repo and summarize the architecture"
 ## Custom config file
 
 The shim defaults to `~/.codex-shim/models.json`. If that file is missing, the
-shim still generates a catalog — and adds the `gpt-5.5` ChatGPT passthrough
-entry only when `~/.codex/auth.json` contains a valid `tokens.access_token`.
+shim still generates a catalog and includes the currently discovered ChatGPT
+passthrough models when `~/.codex/auth.json` contains a valid
+`tokens.access_token`.
 You can point it at any compatible file:
 
 ```bash
@@ -314,12 +317,40 @@ Recommended schema:
       "display_name": "Claude Opus 4.7"
     },
     {
-      "model": "deepseek-v4-pro",
-      "provider": "anthropic",
-      "base_url": "https://api.deepseek.com/anthropic",
-      "api_key": "…",
-      "display_name": "DeepSeek V4 Pro",
-      "no_image_support": true
+      "model": "deepseek-v4-flash",
+      "provider": "responses-api",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "display_name": "DeepSeek-V4-Flash",
+      "no_image_support": true,
+      "supports_responses_compact": false,
+      "catalog": {
+        "context_window": 1048576,
+        "max_context_window": 1048576,
+        "effective_context_window_percent": 95,
+        "auto_compact_token_limit": null,
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+          {"effort": "low", "description": "Fast responses with lighter reasoning"},
+          {"effort": "high", "description": "Deep reasoning for complex tasks"},
+          {"effort": "max", "description": "Maximum reasoning depth"}
+        ],
+        "default_reasoning_summary": "none",
+        "reasoning_summary_format": "experimental",
+        "supports_reasoning_summaries": true,
+        "default_verbosity": "low",
+        "support_verbosity": true,
+        "web_search_tool_type": "text",
+        "supports_search_tool": true,
+        "input_modalities": ["text"],
+        "supports_image_detail_original": false,
+        "supports_parallel_tool_calls": true,
+        "apply_patch_tool_type": "freeform",
+        "shell_type": "shell_command",
+        "prefer_websockets": false,
+        "use_responses_lite": false
+      }
     }
   ]
 }
@@ -327,12 +358,21 @@ Recommended schema:
 
 The loader also accepts camelCase aliases (`baseUrl`, `apiKey`, `apiKeyEnv`,
 `displayName`, `maxContextLimit`, `maxOutputTokens`, `noImageSupport`,
-`extraHeaders`) and a legacy top-level `customModels` array, so existing model
+`supportsResponsesCompact`, `extraHeaders`) and a legacy top-level `customModels` array, so existing model
 config exports can be used directly.
 
 The shim **never writes your API keys** into the generated catalog. Put literal
 keys in your settings file or reference them with `api_key_env`; credentials
 are resolved when requests are handled.
+
+Models that use `api_key_env` are usable only in processes where that variable
+is present. Set it before `generate`, `start`, `restart`, `enable`, `app`, or
+`codex`; a background daemon inherits the environment from the command that
+starts it. Restarting the daemon without the variable makes that model
+unavailable. The shim does not load `.env` or key files automatically. Each CLI
+invocation also reloads settings independently, so `list` run without the
+variable reports the model as missing its API key even if an already-running
+daemon inherited the key earlier.
 
 Supported `provider` values:
 
@@ -341,6 +381,7 @@ Supported `provider` values:
 | `openai` | OpenAI `/v1/chat/completions` |
 | `generic-chat-completion-api` | OpenAI-shaped chat completions |
 | `anthropic` | Anthropic `/v1/messages` |
+| `responses-api` | OpenAI-shaped `/v1/responses` passthrough |
 
 The shim also accepts Anthropic Messages requests at
 `http://127.0.0.1:8765/v1/messages`. For `openai` and
@@ -362,6 +403,65 @@ Useful model fields:
 | `max_output_tokens` | Default max output when translating to Anthropic. |
 | `no_image_support` | When true, catalog advertises text-only input. |
 | `extra_headers` | Optional upstream headers merged into requests. |
+| `supports_responses_compact` | Directly forward `/responses/compact`; defaults to false and summarizes through native `/responses`. |
+| `catalog` | Recursive overrides for Codex model capability metadata; explicit `null` values are preserved and `slug` cannot be overridden. |
+
+### Native Responses providers
+
+Use `provider: "responses-api"` when the upstream implements the Responses API
+itself. The shim maps the picker slug to the configured upstream `model`, adds
+the configured bearer key and extra headers, and relays native JSON or semantic
+SSE events without translating them through chat completions. An explicit
+configured slug takes precedence over an automatically discovered ChatGPT
+passthrough slug with the same name.
+
+Explicit `slug` values are lowercased but preserve periods, underscores, and
+hyphens; automatically generated slugs retain the stricter normalization that
+turns other punctuation into hyphens. The combined catalog is deduplicated by
+exact slug. A usable configured entry replaces an automatic passthrough entry
+with the same slug. If that configured entry lacks credentials, an available
+automatic ChatGPT or Cursor route with the same slug remains usable instead.
+
+The `catalog` object is important when a provider's capabilities differ from
+the shim's generic defaults. It is merged recursively into the generated Codex
+catalog, including explicit `null` values. Upstream URLs and credentials remain
+in the settings file and are never copied into the generated catalog.
+
+Native passthrough preserves the Responses fields Codex sends rather than
+normalizing every provider into one dialect. The upstream must accept those
+fields and semantic SSE events itself; unsupported provider-specific fields and
+errors are returned to Codex. The shim removes only its own encrypted Anthropic
+translation artifacts. An explicitly configured native model also bypasses the
+ChatGPT image fallback, so advertise text-only input accurately when the
+upstream does not support images.
+
+The DeepSeek example above is for `deepseek-v4-flash`, the only DeepSeek model
+that its current [Codex integration documentation](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)
+and [Responses API guide](https://api-docs.deepseek.com/guides/responses_api)
+identify as Responses-compatible. Do not use
+`responses-api` for DeepSeek V4 Pro or the regular DeepSeek models until their
+Responses support is documented. DeepSeek's direct Codex setup changes
+`preferred_auth_method` and `forced_login_method` because Codex contacts
+DeepSeek itself. Those changes are unnecessary here: Codex authenticates to the
+loopback shim with its local dummy token, and the shim supplies
+`DEEPSEEK_API_KEY` to DeepSeek.
+
+To add DeepSeek V4 Flash alongside the discovered passthrough models, save the
+entry above in `~/.codex-shim/models.json`, then start the shim from an
+environment containing its key:
+
+```bash
+export DEEPSEEK_API_KEY="..."
+codex-shim restart
+codex-shim list
+```
+
+For persistent integration, run `codex-shim enable`; ordinary `codex`
+invocations and other tools using the same Codex home then read the combined
+catalog through the shim. DeepSeek need not be the default: select it in the
+model picker or for one command with
+`codex -m deepseek-v4-flash`. Use `codex-shim codex -- ...` instead when you want
+inline shim overrides without modifying `~/.codex/config.toml`.
 
 ### OpenCode Go
 
@@ -614,6 +714,10 @@ Codex Desktop ── /v1/responses ──▶ codex-shim (127.0.0.1:8765)
                                      │       └─▶ baseUrl/chat/completions
                                      │           (Authorization: Bearer apiKey)
                                      │
+                                     ├── provider "responses-api"
+                                     │       └─▶ baseUrl/responses
+                                     │           (native Responses JSON/SSE passthrough)
+                                     │
                                      └── provider "anthropic"
                                              └─▶ baseUrl/messages
                                                  (x-api-key: apiKey, anthropic-version: …)
@@ -621,6 +725,8 @@ Codex Desktop ── /v1/responses ──▶ codex-shim (127.0.0.1:8765)
 
 The shim translates Codex's Responses-API request into the upstream's shape
 (chat completions or Anthropic Messages) and translates the streamed reply back.
+For `responses-api` providers, it preserves the native Responses request and
+reply shapes instead.
 Extended-thinking blocks from Anthropic-shaped upstreams (Claude, DeepSeek,
 GLM, etc.) round-trip through `reasoning.encrypted_content` items.
 
@@ -731,11 +837,31 @@ Codex can compact long sessions through `POST /v1/responses/compact`.
 | ChatGPT passthrough (`gpt-5.5` / `openai-gpt-5-5*`) | Forwards to ChatGPT's native `/backend-api/codex/responses/compact` endpoint and rewrites returned model metadata back to the requested shim slug. |
 | BYOK OpenAI/chat-completions providers | Sends a non-streaming summarization request through `/chat/completions`, then returns a Responses-shaped compacted window whose `output` can be used as the next `input`. |
 | BYOK Anthropic providers | Sends a non-streaming compact request through `/messages`, then returns the same Responses-shaped compacted window. |
+| Native `responses-api` providers | Uses `/responses/compact` only when `supports_responses_compact` is true; otherwise summarizes through native `/responses`, without chat translation. |
 
-The BYOK path intentionally strips provider-hostile fields such as `stream` and
-`service_tier` before forwarding. It preserves the practical Codex behavior — a
-smaller next context window — without pretending third-party chat APIs can emit
-OpenAI's opaque encrypted compaction items.
+Set `supports_responses_compact` only when the upstream explicitly implements
+that endpoint. DeepSeek currently documents `/responses`, but not
+`/responses/compact`, so its V4 Flash entry sets the flag to `false`. Manual or
+automatic compact requests are then converted into a non-streaming
+summarization call to DeepSeek's native `/responses` endpoint and repackaged as
+a compacted window. That fallback never uses Chat Completions.
+
+DeepSeek's published Codex catalog uses a 1,048,576-token context window,
+`effective_context_window_percent: 95`, `auto_compact_token_limit: null`, and a
+Codex-side `truncation_policy` of 10,000 tokens. Keep those values as shown in
+the example above. The catalog truncation policy is not the Responses API
+`truncation` request field: DeepSeek documents that request field as unsupported
+and returns `400` when a request exceeds the context window. The null automatic
+threshold leaves Codex to its model/default compaction behavior; users can
+still invoke `/compact` manually or set Codex's global
+`model_auto_compact_token_limit` if they want an explicit threshold.
+
+The translated BYOK summarization paths intentionally omit provider-hostile
+fields such as `stream` and `service_tier`. Native direct compact passthrough,
+when explicitly enabled, preserves the upstream's native request fields. These
+paths preserve the practical Codex behavior — a smaller next context window —
+without pretending third-party APIs can emit OpenAI's opaque encrypted
+compaction items.
 
 ---
 

@@ -65,6 +65,7 @@ def _default_score(user_text: str) -> dict:
 async def make_upstream(state):
     state.setdefault("chat_requests", [])
     state.setdefault("anthropic_requests", [])
+    state.setdefault("responses_requests", [])
     state.setdefault("classifier_calls", 0)
     state.setdefault("last_backend", None)
     state.setdefault("last_scores", None)
@@ -128,9 +129,32 @@ async def make_upstream(state):
             {"content": [{"type": "text", "text": f"handled by {model}"}], "stop_reason": "end_turn", "usage": {"input_tokens": 2, "output_tokens": 1}}
         )
 
+    async def responses(request):
+        body = await request.json()
+        state["responses_requests"].append({"body": body, "headers": dict(request.headers)})
+        model = body.get("model")
+        state["last_backend"] = model
+        return web.json_response(
+            {
+                "id": "resp_native",
+                "object": "response",
+                "model": model,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": f"handled by {model}"}],
+                    }
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
     app = web.Application()
     app.router.add_post("/v1/chat/completions", chat)
     app.router.add_post("/v1/messages", messages)
+    app.router.add_post("/v1/responses", responses)
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
@@ -299,6 +323,40 @@ async def test_tool_loop_reuses_one_classification_for_a_task(tmp_path):
         assert state["last_backend"] == backend_1  # same backend each turn
 
     assert state["classifier_calls"] == 1  # classifier paid once for the whole task
+
+    await shim.close()
+    await upstream.close()
+
+
+async def test_tool_loop_can_cache_and_route_to_native_responses_candidate(tmp_path):
+    state = {}
+    upstream = await make_upstream(state)
+    upstream_v1 = str(upstream.make_url("/v1"))
+    settings = _settings(
+        tmp_path,
+        upstream_v1,
+        cache=True,
+        strong_provider="responses-api",
+    )
+    shim = await _shim(settings)
+
+    for _ in range(3):
+        resp = await shim.post(
+            "/v1/responses",
+            json={
+                "model": "codex-auto",
+                "input": [
+                    {"role": "user", "content": "implement the parser"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "ran tests"},
+                ],
+            },
+        )
+        assert resp.status == 200
+        assert (await resp.json())["model"] == "strong"
+
+    assert state["classifier_calls"] == 1
+    assert len(state["responses_requests"]) == 3
+    assert all(request["body"]["model"] == "strong-real" for request in state["responses_requests"])
 
     await shim.close()
     await upstream.close()

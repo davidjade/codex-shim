@@ -167,6 +167,11 @@ def slugify(value: str) -> str:
     return slug or "model"
 
 
+def normalize_explicit_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-.")
+    return slug or "model"
+
+
 @dataclass(frozen=True)
 class ShimModel:
     slug: str
@@ -179,6 +184,8 @@ class ShimModel:
     max_context_limit: int | None = None
     max_output_tokens: int | None = None
     no_image_support: bool = False
+    supports_responses_compact: bool = False
+    catalog: dict[str, Any] = field(default_factory=dict)
     extra_headers: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -189,6 +196,10 @@ class ShimModel:
     @property
     def is_openai_chat(self) -> bool:
         return self.provider in {"openai", "generic-chat-completion-api"}
+
+    @property
+    def is_responses_api(self) -> bool:
+        return self.provider == "responses-api"
 
 
 class ModelSettings:
@@ -219,8 +230,12 @@ class ModelSettings:
 
             index = int(row.get("index", fallback_index))
             display_name = str(_field(row, "display_name", "displayName", default=model)).strip()
-            slug_base = str(row.get("slug") or (display_name if model_counts.get(model, 0) > 1 else model))
-            slug = slugify(slug_base)
+            explicit_slug = str(row.get("slug") or "").strip()
+            if explicit_slug:
+                slug = normalize_explicit_slug(explicit_slug)
+            else:
+                slug_base = display_name if model_counts.get(model, 0) > 1 else model
+                slug = slugify(slug_base)
             if slug in used:
                 slug = f"{slug}-{index}"
             while slug in used:
@@ -232,6 +247,9 @@ class ModelSettings:
                 for k, v in (_field(row, "extra_headers", "extraHeaders", default={}) or {}).items()
                 if v is not None
             }
+            catalog = _field(row, "catalog", default={})
+            if not isinstance(catalog, dict):
+                catalog = {}
             api_key_env = str(_field(row, "api_key_env", "apiKeyEnv", default="")).strip()
             api_key = str(_field(row, "api_key", "apiKey", default=""))
             if api_key_env:
@@ -250,6 +268,10 @@ class ModelSettings:
                     max_context_limit=_int_or_none(_field(row, "max_context_limit", "maxContextLimit")),
                     max_output_tokens=_int_or_none(_field(row, "max_output_tokens", "maxOutputTokens")),
                     no_image_support=bool(_field(row, "no_image_support", "noImageSupport", default=False)),
+                    supports_responses_compact=bool(
+                        _field(row, "supports_responses_compact", "supportsResponsesCompact", default=False)
+                    ),
+                    catalog=dict(catalog),
                     extra_headers=extra_headers,
                     raw=row,
                 )
@@ -265,6 +287,9 @@ class ModelSettings:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def by_slug(self, requested: str) -> ShimModel | None:
+        return next((model for model in self.load() if model.slug == requested), None)
 
     def load_router(self):
         """Parse the optional top-level ``router`` block from the settings file."""

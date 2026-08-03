@@ -242,7 +242,13 @@ class ShimServer:
         _log_incoming_request("/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
-        if is_chatgpt_passthrough_slug(model):
+        configured = self._configured_route(model)
+        if configured is not None and configured.is_responses_api:
+            self._require_credentials(configured)
+            forwarded = _sanitize_chatgpt_passthrough_body(body)
+            forwarded["model"] = configured.model
+            return await self._post_native_responses(request, configured, forwarded)
+        if configured is None and is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
             override = model if model != upstream else None
             return await self._chatgpt_passthrough(
@@ -251,7 +257,7 @@ class ShimServer:
                 response_model_override=override,
                 upstream_model=upstream,
             )
-        if is_cursor_passthrough_slug(model):
+        if configured is None and is_cursor_passthrough_slug(model):
             return await self._cursor_passthrough(
                 request,
                 body,
@@ -260,7 +266,8 @@ class ShimServer:
             )
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
-        route = self._route(body)
+        route = configured or self._route(body)
+        self._require_credentials(route)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
@@ -274,10 +281,26 @@ class ShimServer:
         _log_incoming_request("/v1/responses/compact", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
-        if is_chatgpt_passthrough_slug(model):
+        configured = self._configured_route(model)
+        if configured is not None and configured.is_responses_api:
+            self._require_credentials(configured)
+            if configured.supports_responses_compact:
+                forwarded = _sanitize_chatgpt_passthrough_body(body)
+                forwarded["model"] = configured.model
+                forwarded.pop("stream", None)
+                return await self._post_native_responses(
+                    request,
+                    configured,
+                    forwarded,
+                    endpoint="/responses/compact",
+                )
+            compact_body = _compact_request_body(body, configured.model)
+            response = await self._post_native_responses(request, configured, compact_body)
+            return await _as_compact_response(response, configured.slug)
+        if configured is None and is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
-        if is_cursor_passthrough_slug(model):
+        if configured is None and is_cursor_passthrough_slug(model):
             compact_body = dict(body)
             compact_body["input"] = body.get("input") or []
             compact_body["instructions"] = (
@@ -291,7 +314,8 @@ class ShimServer:
                 upstream_model=cursor_upstream_model(model),
                 force_non_stream=True,
             )
-        route = self._route(body)
+        route = configured or self._route(body)
+        self._require_credentials(route)
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
@@ -743,9 +767,71 @@ class ShimServer:
         route = self.settings.by_slug_or_model(requested)
         if route is None:
             raise web.HTTPNotFound(text=f"Unknown model slug/model: {requested}")
+        self._require_credentials(route)
+        return route
+
+    def _configured_route(self, requested: str) -> ShimModel | None:
+        route = self.settings.by_slug(requested)
+        if route is None or byok_model_has_credentials(route):
+            return route
+        if chatgpt_passthrough_available() and is_chatgpt_passthrough_slug(requested):
+            return None
+        if cursor_passthrough_available() and is_cursor_passthrough_slug(requested):
+            return None
+        return route
+
+    def _require_credentials(self, route: ShimModel) -> None:
         if not byok_model_has_credentials(route):
             raise web.HTTPUnauthorized(text=_missing_api_key_message(route))
-        return route
+
+    async def _post_native_responses(
+        self,
+        request: web.Request,
+        route: ShimModel,
+        body: dict[str, Any],
+        endpoint: str = "/responses",
+    ) -> web.StreamResponse:
+        url = _join_url(route.base_url, endpoint)
+        headers = _openai_headers(route)
+        headers.setdefault("Accept", "text/event-stream" if body.get("stream") else "application/json")
+        _dump_debug_request(route.slug, url, body)
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                return await _error_response(upstream, slug=route.slug)
+            if body.get("stream"):
+                return await self._stream_native_responses(request, upstream, route)
+            payload = await upstream.json(content_type=None)
+        _rewrite_matching_response_model(payload, route.model, route.slug)
+        return web.json_response(payload)
+
+    async def _stream_native_responses(
+        self,
+        request: web.Request,
+        upstream,
+        route: ShimModel,
+    ) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        try:
+            if route.model == route.slug:
+                async for chunk in upstream.content.iter_chunked(4096):
+                    await _safe_write(response, chunk)
+            else:
+                async for block in _sse_blocks(upstream):
+                    await _safe_write(
+                        response,
+                        _rewrite_native_sse_block(block, route.model, route.slug),
+                    )
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
 
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
@@ -982,14 +1068,18 @@ def _has_shim_encrypted_content(value: dict[str, Any]) -> bool:
 def _rewrite_response_model(payload: Any, model: str | None) -> None:
     if not model:
         return
+    _rewrite_matching_response_model(payload, CHATGPT_MODEL_SLUG, model)
+
+
+def _rewrite_matching_response_model(payload: Any, upstream_model: str, requested_model: str) -> None:
     if isinstance(payload, dict):
-        if payload.get("model") == CHATGPT_MODEL_SLUG:
-            payload["model"] = model
+        if payload.get("model") == upstream_model:
+            payload["model"] = requested_model
         for value in payload.values():
-            _rewrite_response_model(value, model)
+            _rewrite_matching_response_model(value, upstream_model, requested_model)
     elif isinstance(payload, list):
         for item in payload:
-            _rewrite_response_model(item, model)
+            _rewrite_matching_response_model(item, upstream_model, requested_model)
 
 
 class AnthropicMessagesStreamState:
@@ -2075,6 +2165,46 @@ async def _sse_lines(upstream) -> Any:
     tail = buffer.decode("utf-8", errors="replace").strip()
     if tail.startswith("data:"):
         yield tail[5:].strip()
+
+
+async def _sse_blocks(upstream) -> Any:
+    """Yield complete SSE blocks while tolerating LF and CRLF framing."""
+    buffer = b""
+    async for chunk in upstream.content.iter_chunked(4096):
+        buffer += chunk
+        while True:
+            lf = buffer.find(b"\n\n")
+            crlf = buffer.find(b"\r\n\r\n")
+            positions = [(lf, 2), (crlf, 4)]
+            positions = [(position, width) for position, width in positions if position >= 0]
+            if not positions:
+                break
+            position, width = min(positions, key=lambda pair: pair[0])
+            yield buffer[:position]
+            buffer = buffer[position + width :]
+    if buffer:
+        yield buffer
+
+
+def _rewrite_native_sse_block(block: bytes, upstream_model: str, requested_model: str) -> bytes:
+    lines: list[str] = []
+    for raw_line in block.decode("utf-8", errors="replace").splitlines():
+        if not raw_line.startswith("data:"):
+            lines.append(raw_line)
+            continue
+        prefix, data = raw_line.split(":", 1)
+        value = data.lstrip()
+        if value == "[DONE]":
+            lines.append(raw_line)
+            continue
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            lines.append(raw_line)
+            continue
+        _rewrite_matching_response_model(payload, upstream_model, requested_model)
+        lines.append(f"{prefix}: {json.dumps(payload, separators=(',', ':'))}")
+    return ("\n".join(lines) + "\n\n").encode()
 
 
 def _anthropic_stream_to_chat_chunk(event: dict[str, Any], model: str) -> dict[str, Any]:

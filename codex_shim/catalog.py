@@ -25,7 +25,7 @@ def catalog_entry(model: ShimModel) -> dict:
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
     reasoning = _reasoning_effort(model)
-    return {
+    entry = {
         "slug": model.slug,
         "display_name": model.display_name,
         "description": f"{model.display_name} via local Codex shim.",
@@ -70,6 +70,33 @@ def catalog_entry(model: ShimModel) -> dict:
             "instructions_variables": {"model_name": model.display_name},
         },
     }
+    _merge_catalog_overrides(entry, model.catalog)
+    entry["slug"] = model.slug
+    return entry
+
+
+_PROTECTED_CATALOG_KEYS = {
+    "slug",
+    "model",
+    "provider",
+    "base_url",
+    "baseUrl",
+    "api_key",
+    "apiKey",
+    "api_key_env",
+    "apiKeyEnv",
+}
+
+
+def _merge_catalog_overrides(target: dict, overrides: dict, *, _root: bool = True) -> None:
+    """Recursively merge JSON catalog metadata, preserving explicit nulls."""
+    for key, value in overrides.items():
+        if _root and key in _PROTECTED_CATALOG_KEYS:
+            continue
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _merge_catalog_overrides(target[key], value, _root=False)
+        else:
+            target[key] = value
 
 
 def chatgpt_passthrough_entries() -> list[dict]:
@@ -107,7 +134,19 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None) -> Pa
         entry = cursor_catalog_entry()
         entry["isDefault"] = not chatgpt_passthrough_available()
         entries.append(entry)
-    entries.extend(catalog_entry(model) for model in usable_byok_models(models))
+    positions = {
+        str(entry.get("slug")): index
+        for index, entry in enumerate(entries)
+        if entry.get("slug")
+    }
+    for model in usable_byok_models(models):
+        entry = catalog_entry(model)
+        existing = positions.get(model.slug)
+        if existing is None:
+            positions[model.slug] = len(entries)
+            entries.append(entry)
+        else:
+            entries[existing] = entry
     payload = {"models": entries}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path
@@ -178,4 +217,3 @@ def _reasoning_effort(model: ShimModel) -> str:
 
 def _toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
-

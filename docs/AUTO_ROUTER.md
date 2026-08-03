@@ -139,13 +139,13 @@ The `router` block in your settings file:
 | `enabled` | Turn the router on/off. Also overridable at runtime with `CODEX_SHIM_DISABLE_ROUTER=1`. |
 | `slug` | The picker slug for the Auto entry. Defaults to `codex-auto`. |
 | `display_name` | Picker label. Defaults to `Auto (smart routing)`. |
-| `classifier` | A model **slug** (one of your configured BYOK models) used as the scorer. Use your cheapest, fastest model. Must be an `openai`/`generic-chat-completion-api` or `anthropic` model with a key. If it's missing/unavailable, the router falls back to the cheapest candidate **without scoring**. |
+| `classifier` | A model **slug** (one of your configured BYOK models) used as the scorer. Use your cheapest, fastest model. Must be an `openai`/`generic-chat-completion-api` or `anthropic` model with a key; `responses-api` models can be candidates but are not classifiers. If it's missing/unavailable, the router falls back to the cheapest candidate **without scoring**. |
 | `threshold` | `0–1`. The bar a candidate's score must clear. **Lower = more aggressive savings** (cheap models win more often); **higher = escalate to strong models sooner**. `0.7` is a good start. |
 | `default` | Candidate slug used when classification can't run at all. Defaults to the cheapest candidate. |
 | `cache` | Reuse one classification across a task's follow-up tool calls. Recommended. |
 | `timeout` | Seconds to wait for the classifier before falling back. Default `12`. Overridable with `CODEX_SHIM_ROUTER_TIMEOUT`. |
 | `max_tokens` | Max tokens for the classifier reply (it only emits small JSON). Default `600`. Overridable with `CODEX_SHIM_ROUTER_MAX_TOKENS`. |
-| `candidates[].slug` | Must match a model slug, ChatGPT passthrough slug, or Cursor passthrough slug. Unusable ones are silently skipped. |
+| `candidates[].slug` | Must match a configured model slug (including `responses-api`), ChatGPT passthrough slug, or Cursor passthrough slug. Unusable ones are silently skipped. Native Responses candidates are supported on the router's `/responses` and `/responses/compact` paths, not its compatibility `/chat/completions` path. |
 | `candidates[].cost` | A **relative** weight; units don't matter, only the ordering. Lowest cost among the "good enough" candidates wins. |
 | `candidates[].supports_images` | If `false`, the candidate is hard-scored `0` whenever the task includes images. |
 | `candidates[].card` | The capability description the classifier reads. **This is the single most important field** — be honest about strengths and weaknesses; that's what makes routing smart. |

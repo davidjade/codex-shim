@@ -230,6 +230,180 @@ async def test_responses_routes_to_openai_chat(tmp_path):
     await upstream_client.close()
 
 
+async def test_responses_api_nonstream_passthrough_preserves_native_shape(tmp_path, auth_missing):
+    captured = {}
+
+    async def responses(request):
+        captured["headers"] = dict(request.headers)
+        captured["body"] = await request.json()
+        return web.json_response(
+            {
+                "id": "resp_native",
+                "object": "response",
+                "model": "upstream-native",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "model": "upstream-native", "content": "thought"},
+                    {"type": "web_search_call", "status": "completed"},
+                    {"type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch"},
+                    {"type": "message", "model": "unrelated-model", "content": []},
+                ],
+                "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "native-slug",
+                        "model": "upstream-native",
+                        "provider": "responses-api",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                        "extra_headers": {"X-Provider": "native"},
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "native-slug",
+            "instructions": "keep native",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {
+                    "type": "reasoning",
+                    "encrypted_content": f"{SHIM_ENCRYPTED_CONTENT_PREFIX}local",
+                },
+            ],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "custom", "name": "apply_patch"},
+                {"type": "image_generation", "name": "image_generation"},
+            ],
+            "reasoning": {"effort": "max"},
+            "service_tier": "priority",
+            "stream": False,
+        },
+    )
+
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["model"] == "native-slug"
+    assert payload["output"][0]["model"] == "native-slug"
+    assert payload["output"][3]["model"] == "unrelated-model"
+    assert [item.get("type") for item in payload["output"]] == [
+        "reasoning",
+        "web_search_call",
+        "custom_tool_call",
+        "message",
+    ]
+    assert captured["body"]["model"] == "upstream-native"
+    assert captured["body"]["instructions"] == "keep native"
+    assert captured["body"]["reasoning"] == {"effort": "max"}
+    assert captured["body"]["service_tier"] == "priority"
+    assert len(captured["body"]["input"]) == 1
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+    assert captured["headers"]["X-Provider"] == "native"
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_responses_api_stream_preserves_semantic_sse_without_done(tmp_path, auth_missing):
+    async def responses(request):
+        body = await request.json()
+        assert body["model"] == "upstream-native"
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        events = [
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_1", "model": "upstream-native", "status": "in_progress"},
+            },
+            {
+                "type": "response.reasoning_text.delta",
+                "sequence_number": 1,
+                "delta": "thinking",
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": 2,
+                "delta": "{\"path\":",
+            },
+            {
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_1",
+                    "model": "upstream-native",
+                    "status": "completed",
+                    "output": [{"type": "custom_tool_call", "name": "apply_patch"}],
+                    "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                },
+            },
+        ]
+        for event in events:
+            encoded = json.dumps(event).encode()
+            await response.write(b"event: " + event["type"].encode() + b"\r\ndata: " + encoded + b"\r\n\r\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "native-slug",
+                        "model": "upstream-native",
+                        "provider": "responses-api",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "native-slug", "input": "hi", "stream": True},
+    )
+    text = await resp.text()
+
+    assert resp.status == 200
+    assert "event: response.created" in text
+    assert "event: response.reasoning_text.delta" in text
+    assert "event: response.function_call_arguments.delta" in text
+    assert "event: response.completed" in text
+    assert '"model":"native-slug"' in text
+    assert '"sequence_number":3' in text
+    assert "[DONE]" not in text
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
 async def test_missing_api_key_env_has_model_specific_error(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENCODE_GO_API_KEY", raising=False)
     settings = tmp_path / "settings.json"
@@ -485,6 +659,206 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
     assert captured["headers"]["Accept"] == "application/json"
 
     await shim_client.close()
+
+
+async def test_responses_api_compact_falls_back_to_native_responses(tmp_path, auth_missing):
+    captured = {}
+
+    async def responses(request):
+        captured["body"] = await request.json()
+        return web.json_response(
+            {
+                "id": "resp_summary",
+                "object": "response",
+                "model": "upstream-native",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Native compact handoff"}],
+                    }
+                ],
+                "usage": {"input_tokens": 8, "output_tokens": 3, "total_tokens": 11},
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "native-slug",
+                        "model": "upstream-native",
+                        "provider": "responses-api",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses/compact",
+        json={"model": "native-slug", "input": [{"role": "user", "content": "keep this"}], "stream": True},
+    )
+    payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["model"] == "native-slug"
+    assert payload["output"][0]["content"][0]["text"] == "Native compact handoff"
+    assert captured["body"]["model"] == "upstream-native"
+    assert captured["body"]["stream"] is False
+    assert "Compact the conversation" in captured["body"]["instructions"]
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_responses_api_compact_can_use_native_compact_endpoint(tmp_path, auth_missing):
+    captured = {}
+
+    async def compact(request):
+        captured["body"] = await request.json()
+        return web.json_response(
+            {
+                "id": "resp_compact",
+                "object": "response.compaction",
+                "model": "upstream-native",
+                "output": [{"type": "compaction", "model": "upstream-native"}],
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses/compact", compact)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "native-slug",
+                        "model": "upstream-native",
+                        "provider": "responses-api",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                        "supportsResponsesCompact": True,
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses/compact",
+        json={"model": "native-slug", "input": "hi", "stream": True},
+    )
+    payload = await resp.json()
+
+    assert resp.status == 200
+    assert payload["model"] == "native-slug"
+    assert payload["output"][0]["model"] == "native-slug"
+    assert captured["body"]["model"] == "upstream-native"
+    assert "stream" not in captured["body"]
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_explicit_responses_slug_wins_over_chatgpt_magic_slug(tmp_path, auth_present):
+    calls = []
+
+    async def responses(request):
+        calls.append(await request.json())
+        return web.json_response(
+            {
+                "id": "resp_explicit",
+                "object": "response",
+                "model": "vendor-gpt",
+                "status": "completed",
+                "output": [],
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.5",
+                        "model": "vendor-gpt",
+                        "provider": "responses-api",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post("/v1/responses", json={"model": "gpt-5.5", "input": "hi"})
+
+    assert resp.status == 200
+    assert (await resp.json())["model"] == "gpt-5.5"
+    assert calls == [{"model": "vendor-gpt", "input": "hi"}]
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_responses_api_propagates_upstream_error(tmp_path, auth_missing):
+    async def responses(_request):
+        return web.json_response({"error": {"message": "rate limited"}}, status=429)
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "native-slug",
+                        "model": "upstream-native",
+                        "provider": "responses-api",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post("/v1/responses", json={"model": "native-slug", "input": "hi"})
+
+    assert resp.status == 429
+    assert "rate limited" in await resp.text()
+
+    await shim_client.close()
+    await upstream_client.close()
 
 
 async def test_health_and_models_include_chatgpt_passthrough_when_auth_present(tmp_path, auth_present, monkeypatch):
@@ -1212,9 +1586,9 @@ async def test_api_models_includes_chatgpt_when_auth_present(
     try:
         resp = await shim_client.get("/api/models")
         data = await resp.json()
-        slugs = [m["slug"] for m in data]
-        assert slugs[0] == "gpt-5.5"
-        assert data[0]["active"] is True
+        models = {model["slug"]: model for model in data}
+        assert "gpt-5.5" in models
+        assert models["gpt-5.5"]["active"] is True
     finally:
         await shim_client.close()
 

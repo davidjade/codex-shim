@@ -44,6 +44,33 @@ def test_duplicate_models_get_unique_display_slugs(tmp_path):
     assert [m.slug for m in models] == ["fast-high", "fast-low"]
 
 
+def test_explicit_slug_preserves_dots_while_generated_slug_remains_normalized(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "GPT-5.5 Vendor",
+                        "model": "vendor-model",
+                        "provider": "responses-api",
+                        "base_url": "http://x/v1",
+                    },
+                    {
+                        "model": "model.with.dots",
+                        "provider": "responses-api",
+                        "base_url": "http://x/v1",
+                    },
+                ]
+            }
+        )
+    )
+
+    models = ModelSettings(settings).load()
+
+    assert [model.slug for model in models] == ["gpt-5.5-vendor", "model-with-dots"]
+
+
 def test_legacy_custom_models_schema_still_loads(tmp_path):
     settings = tmp_path / "settings.json"
     settings.write_text(
@@ -129,6 +156,74 @@ def test_api_key_env_missing_without_literal_stays_empty(monkeypatch, tmp_path):
     [model] = ModelSettings(settings).load()
 
     assert model.api_key == ""
+
+
+def test_responses_api_settings_load_compact_alias_and_catalog(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "native-model",
+                        "model": "upstream-native",
+                        "provider": "responses-api",
+                        "base_url": "https://provider.example/v1",
+                        "api_key": "secret",
+                        "supportsResponsesCompact": True,
+                        "catalog": {
+                            "context_window": 1_048_576,
+                            "auto_compact_token_limit": None,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    [model] = ModelSettings(settings).load()
+
+    assert model.is_responses_api is True
+    assert model.supports_responses_compact is True
+    assert model.catalog == {
+        "context_window": 1_048_576,
+        "auto_compact_token_limit": None,
+    }
+
+
+def test_catalog_overrides_merge_recursively_and_protect_routing_identity():
+    from codex_shim.settings import ShimModel
+
+    model = ShimModel(
+        slug="deepseek-v4-flash",
+        model="deepseek-v4-flash",
+        display_name="DeepSeek-V4-Flash",
+        provider="responses-api",
+        base_url="https://api.deepseek.com",
+        api_key="secret",
+        no_image_support=True,
+        catalog={
+            "slug": "must-not-replace-routing-slug",
+            "context_window": 1_048_576,
+            "auto_compact_token_limit": None,
+            "truncation_policy": {"limit": 10_000},
+            "supports_search_tool": True,
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "high"},
+                {"effort": "max"},
+            ],
+        },
+    )
+
+    entry = catalog_entry(model)
+
+    assert entry["slug"] == "deepseek-v4-flash"
+    assert entry["context_window"] == 1_048_576
+    assert entry["auto_compact_token_limit"] is None
+    assert entry["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+    assert entry["supports_search_tool"] is True
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == ["low", "high", "max"]
 
 
 def test_opencode_go_model_row_prefers_chat_and_prefixes_slug():
@@ -371,6 +466,32 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
     assert [model["slug"] for model in data["models"]] == list(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+
+
+def test_write_catalog_explicit_model_replaces_automatic_passthrough_slug(
+    tmp_path, auth_present, monkeypatch
+):
+    from codex_shim.settings import ShimModel
+
+    monkeypatch.setattr(
+        "codex_shim.catalog.load_chatgpt_passthrough_catalog_models",
+        lambda: [{"slug": "gpt-5.5", "display_name": "Automatic GPT"}],
+    )
+    explicit = ShimModel(
+        slug="gpt-5.5",
+        model="vendor-gpt",
+        display_name="Explicit Vendor GPT",
+        provider="responses-api",
+        base_url="https://vendor.example/v1",
+        api_key="secret",
+    )
+    catalog_path = tmp_path / "catalog.json"
+
+    write_catalog([explicit], catalog_path)
+    entries = json.loads(catalog_path.read_text())["models"]
+
+    assert [entry["slug"] for entry in entries] == ["gpt-5.5"]
+    assert entries[0]["display_name"] == "Explicit Vendor GPT"
 
 
 def test_managed_config_escapes_windows_catalog_path(monkeypatch):
