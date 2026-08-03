@@ -190,6 +190,14 @@ Path behavior is intentionally ordinary:
   the native Windows install path or manually keep the Windows config in sync.
 - The local provider URL is still `http://127.0.0.1:8765/v1`.
 
+Treat native Windows and WSL as separate installations. A Codex extension
+running in a WSL Remote window reads the WSL config/catalog and uses the WSL
+shim; a locally running Windows extension reads `%USERPROFILE%\.codex` and uses
+the native Windows shim. Each may listen on its own `127.0.0.1:8765`. Install,
+start, configure, and patch the extension in the environment where that Codex
+extension actually runs. Copy `models.json` or recreate its environment
+variables separately if both environments should expose the same models.
+
 The optional macOS picker patch is not required for the shim server to work. On
 Windows, if Codex can read the generated catalog/provider config, requests route
 through the same local endpoint as every other platform.
@@ -1026,6 +1034,8 @@ codex-shim codex -- <args>   exec `codex` CLI through inline shim overrides
 codex-shim app [path]        launch Codex Desktop through managed shim config
 codex-shim patch-app         patch macOS Codex Desktop picker allowlist
 codex-shim restore-app       restore macOS app.asar from patch backup
+codex-shim patch-vscode      patch selected Codex VS Code extension pickers
+codex-shim restore-vscode    restore selected VS Code picker bundle backups
 
 codex-app [path]             shortcut for `codex-shim app`
 codex-model [list|<slug>]    shortcut for `codex-shim model …`
@@ -1038,6 +1048,69 @@ Global flags:
 
 `patch-app` and `restore-app` always target `/Applications/Codex.app`, do not
 use `--settings`, and exit with a clear error on Windows/Linux.
+
+### VS Code extension picker patch
+
+The Codex VS Code extension can apply the same server-side model allowlist as
+Codex Desktop. An already-selected custom model then appears as `Custom`, but
+disappears after selecting an OpenAI model. Patch one or more installed
+extension copies with:
+
+```bash
+codex-shim patch-vscode
+```
+
+The command discovers Codex extensions in standard VS Code, VS Code Server,
+Insiders, and Cursor locations and presents a numbered multi-selection. Press
+Enter to select the newest unpatched copy, enter values such as `1,3-4`, or use
+`all`. For noninteractive use, pass a repeatable explicit path or select every
+recognized copy:
+
+```bash
+codex-shim patch-vscode --extension ~/.vscode-server/extensions/openai.chatgpt-26.727.40816-linux-x64
+codex-shim patch-vscode --all
+```
+
+The patch changes only the model-picker filter in the extension's ordinary
+JavaScript bundle. Originals and a hash manifest are stored under
+`.codex-shim/vscode-backups/`. Run **Developer: Reload Window** afterward.
+Compatibility is determined by finding exactly one recognized picker code
+pattern, not by an extension-version allowlist. The displayed version is used
+for identification and backup organization only.
+
+VS Code updates install a new, unpatched versioned extension directory. Rerun
+`codex-shim patch-vscode`; the newest unpatched version is the default choice,
+while older patched copies remain unchanged. Unknown bundle layouts fail closed
+without editing the extension.
+
+For a clean model-switch check, open a new chat, select the model before its
+first message, and confirm the request in `.codex-shim/shim.log`:
+
+```text
+[req] /v1/responses model='deepseek-v4-flash'
+```
+
+The request log is authoritative. Asking a model to identify itself is not:
+models can repeat stale conversation text or report an incorrect product/model
+name even when routing is correct. Avoid selecting internal-purpose entries
+such as `codex-auto-review` if one is present in an upstream Codex model cache.
+
+Restore selected copies with the same targeting interface:
+
+```bash
+codex-shim restore-vscode
+codex-shim restore-vscode --all
+```
+
+Restore proceeds only when the current bundle exactly matches the patched hash
+recorded in its manifest. If an update or another edit changed the bundle, the
+command refuses to overwrite it; reinstall that extension version or patch its
+current bundle instead. If patching is unavailable, select a shim model outside
+the extension and reload VS Code:
+
+```bash
+codex-shim model use deepseek-v4-flash
+```
 
 ---
 

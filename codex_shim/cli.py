@@ -17,6 +17,7 @@ import json
 import plistlib
 import re
 import struct
+from datetime import datetime, timezone
 from urllib.request import urlopen
 
 from . import router as router_module
@@ -67,6 +68,7 @@ PREVIOUS_TOP_LEVEL_PREFIX = "# codex-shim previous-top-level = "
 MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json"}
 APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
 INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
+VSCODE_BACKUP_DIR_NAME = "vscode-backups"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
 USER_CODEX_APP = Path.home() / "Applications" / "Codex.app"
 MODEL_PICKER_NEEDLE = re.compile(
@@ -92,6 +94,30 @@ SIDEBAR_RECENT_THREADS_APPLIED = re.compile(
     r"\.recentConversationSortKey,modelProviders:\[\],archived:!1,sourceKinds:\w+"
 )
 
+VSCODE_PICKER_MARKER = "/*codex-shim:vscode-model-picker*/"
+VSCODE_LEGACY_PICKER_MARKER = "/*codex-shim:model-picker*/"
+VSCODE_PICKER_NEEDLE = re.compile(
+    r"(?P<prefix>function \w+\(\{additionalAvailableModels:(?P<additional>\w+),"
+    r"authMethod:(?P<auth>\w+),availableModels:(?P<available>\w+),"
+    r"model:(?P<model>\w+),useHiddenModels:(?P<hidden>\w+)\}\)\{return "
+    r"(?P=additional)\?\.has\((?P=model)\.model\)===!0\|\|\()"
+    r"(?P=hidden)&&(?P=auth)!==`amazonBedrock`\?"
+    r"(?P=available)\.has\((?P=model)\.model\):!(?P=model)\.hidden"
+    r"(?P<suffix>\)\})"
+)
+VSCODE_PICKER_REPLACEMENT = (
+    r"\g<prefix>" + VSCODE_PICKER_MARKER + r"!\g<model>.hidden\g<suffix>"
+)
+
+
+@dataclass(frozen=True)
+class VSCodeExtension:
+    path: Path
+    version: str
+    location: str
+    bundle: Path | None
+    status: str
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="codex-shim")
@@ -109,6 +135,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor", help="Print a read-only local diagnostics report.")
     sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
+    for command, help_text in (
+        ("patch-vscode", "Patch Codex VS Code extension pickers for custom shim models."),
+        ("restore-vscode", "Restore Codex VS Code extension picker bundles from backups."),
+    ):
+        vscode_parser = sub.add_parser(command, help=help_text)
+        target = vscode_parser.add_mutually_exclusive_group()
+        target.add_argument("--extension", type=Path, action="append", dest="extensions")
+        target.add_argument("--all", action="store_true", dest="all_extensions")
 
     opencode_parser = sub.add_parser("opencode-go", help="Discover and configure OpenCode Go models.")
     opencode_sub = opencode_parser.add_subparsers(dest="opencode_go_command", required=True)
@@ -159,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
         return patch_codex_app()
     if args.command == "restore-app":
         return restore_codex_app_bundle()
+    if args.command == "patch-vscode":
+        return patch_vscode_extensions(args.extensions, args.all_extensions)
+    if args.command == "restore-vscode":
+        return restore_vscode_extensions(args.extensions, args.all_extensions)
     if args.command == "opencode-go":
         if args.opencode_go_command == "refresh":
             return refresh_opencode_go(args.settings, args.api_key_env, args.base_url, args.prefer, args.timeout)
@@ -832,6 +870,285 @@ def _has_command(command: str) -> bool:
     from shutil import which
 
     return which(command) is not None
+
+
+def _vscode_extension_roots() -> list[tuple[str, Path]]:
+    home = Path.home()
+    return [
+        ("VS Code", home / ".vscode" / "extensions"),
+        ("VS Code Server", home / ".vscode-server" / "extensions"),
+        ("VS Code Insiders", home / ".vscode-insiders" / "extensions"),
+        ("VS Code Server Insiders", home / ".vscode-server-insiders" / "extensions"),
+        ("Cursor", home / ".cursor" / "extensions"),
+        ("Cursor Server", home / ".cursor-server" / "extensions"),
+    ]
+
+
+def discover_vscode_extensions() -> list[VSCodeExtension]:
+    found: list[VSCodeExtension] = []
+    seen: set[Path] = set()
+    for location, root in _vscode_extension_roots():
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("openai.chatgpt-*")):
+            resolved = path.resolve()
+            if resolved in seen or not path.is_dir():
+                continue
+            extension = _inspect_vscode_extension(path, location)
+            if extension is not None:
+                found.append(extension)
+                seen.add(resolved)
+    return sorted(found, key=lambda item: (_version_key(item.version), str(item.path)), reverse=True)
+
+
+def _inspect_vscode_extension(path: Path, location: str = "Explicit") -> VSCodeExtension | None:
+    manifest_path = path / "package.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if manifest.get("publisher") != "openai" or manifest.get("name") != "chatgpt":
+        return None
+    version = str(manifest.get("version") or "unknown")
+    bundles = sorted((path / "webview" / "assets").glob("app-initial-*.js"))
+    unpatched: list[Path] = []
+    patched: list[Path] = []
+    legacy_patched: list[Path] = []
+    for bundle in bundles:
+        text = _read_text_lossy(bundle)
+        if VSCODE_PICKER_NEEDLE.search(text):
+            unpatched.append(bundle)
+        if VSCODE_PICKER_MARKER in text:
+            patched.append(bundle)
+        if VSCODE_LEGACY_PICKER_MARKER in text:
+            legacy_patched.append(bundle)
+    if legacy_patched and not patched:
+        return VSCodeExtension(path, version, location, legacy_patched[0], "legacy-patched")
+    if len(unpatched) == 1 and not patched:
+        return VSCodeExtension(path, version, location, unpatched[0], "unpatched")
+    if len(patched) == 1 and not unpatched:
+        return VSCodeExtension(path, version, location, patched[0], "patched")
+    return VSCodeExtension(path, version, location, None, "unsupported")
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    values = [int(value) for value in re.findall(r"\d+", version)]
+    return tuple(values) if values else (0,)
+
+
+def _resolve_vscode_targets(
+    explicit: list[Path] | None,
+    all_extensions: bool,
+    *,
+    operation: str,
+) -> list[VSCodeExtension] | None:
+    if explicit:
+        targets: list[VSCodeExtension] = []
+        for path in explicit:
+            extension = _inspect_vscode_extension(path.expanduser().resolve())
+            if extension is None:
+                print(f"Not a valid OpenAI Codex extension: {path}", file=sys.stderr)
+                return None
+            targets.append(extension)
+        return targets
+    discovered = discover_vscode_extensions()
+    if not discovered:
+        print("No OpenAI Codex VS Code extensions were found.", file=sys.stderr)
+        return None
+    if all_extensions:
+        return discovered
+    return _prompt_vscode_targets(discovered, operation)
+
+
+def _prompt_vscode_targets(
+    extensions: list[VSCodeExtension], operation: str
+) -> list[VSCodeExtension] | None:
+    print("Detected Codex extensions:\n")
+    for index, extension in enumerate(extensions, 1):
+        print(
+            f"  {index}. {extension.version:<14} {extension.location:<24} "
+            f"{extension.status.upper():<11} {extension.path}"
+        )
+    desired = {"unpatched"} if operation == "patch" else {"patched", "legacy-patched"}
+    default = next((index for index, item in enumerate(extensions, 1) if item.status in desired), None)
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        response = input(f"\nSelection (numbers, ranges, all, or q){suffix}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return None
+    if not response and default is not None:
+        response = str(default)
+    if response in {"q", "quit", "cancel", ""}:
+        print("Cancelled.")
+        return None
+    if response == "all":
+        return extensions
+    try:
+        indexes = _parse_number_selection(response, len(extensions))
+    except ValueError as exc:
+        print(f"Invalid selection: {exc}", file=sys.stderr)
+        return None
+    return [extensions[index - 1] for index in indexes]
+
+
+def _parse_number_selection(value: str, maximum: int) -> list[int]:
+    selected: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError("empty selection item")
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(f"reversed range {part}")
+            selected.update(range(start, end + 1))
+        else:
+            selected.add(int(part))
+    if not selected or min(selected) < 1 or max(selected) > maximum:
+        raise ValueError(f"choose values from 1 to {maximum}")
+    return sorted(selected)
+
+
+def patch_vscode_extensions(explicit: list[Path] | None = None, all_extensions: bool = False) -> int:
+    targets = _resolve_vscode_targets(explicit, all_extensions, operation="patch")
+    if targets is None:
+        return 1
+    failures = 0
+    changed = 0
+    for extension in targets:
+        if extension.status == "patched":
+            print(f"Already patched: {extension.path}")
+            continue
+        if extension.status == "legacy-patched":
+            print(
+                f"Legacy ineffective patch detected: {extension.path}. "
+                "Run restore-vscode for this copy, then run patch-vscode again.",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
+        if extension.status != "unpatched" or extension.bundle is None:
+            print(f"Unsupported extension bundle; left unchanged: {extension.path}", file=sys.stderr)
+            failures += 1
+            continue
+        if not _path_is_writable(extension.bundle):
+            print(f"Extension bundle is not writable: {extension.bundle}", file=sys.stderr)
+            failures += 1
+            continue
+        try:
+            original = extension.bundle.read_bytes()
+        except OSError as exc:
+            print(f"Could not read extension bundle {extension.bundle}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        original_hash = hashlib.sha256(original).hexdigest()
+        text = original.decode("utf-8")
+        matches = list(VSCODE_PICKER_NEEDLE.finditer(text))
+        if len(matches) != 1:
+            print(f"Expected one model picker filter in {extension.bundle}; left unchanged.", file=sys.stderr)
+            failures += 1
+            continue
+        patched = VSCODE_PICKER_NEEDLE.sub(VSCODE_PICKER_REPLACEMENT, text, count=1).encode("utf-8")
+        patched_hash = hashlib.sha256(patched).hexdigest()
+        try:
+            _write_vscode_backup(extension, original, original_hash, patched_hash)
+            extension.bundle.write_bytes(patched)
+        except OSError as exc:
+            print(f"Could not back up or patch {extension.bundle}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        print(f"Patched Codex extension {extension.version}: {extension.path}")
+        changed += 1
+    if changed:
+        print("Run 'Developer: Reload Window' in VS Code to load the patched picker.")
+    return 1 if failures else 0
+
+
+def _write_vscode_backup(
+    extension: VSCodeExtension, original: bytes, original_hash: str, patched_hash: str
+) -> Path:
+    identity = hashlib.sha256(f"{extension.path.resolve()}\0{original_hash}".encode()).hexdigest()[:16]
+    backup_dir = RUNTIME_DIR / VSCODE_BACKUP_DIR_NAME / f"{extension.version}-{identity}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    bundle_backup = backup_dir / "bundle.js"
+    manifest_path = backup_dir / "manifest.json"
+    if not bundle_backup.exists():
+        bundle_backup.write_bytes(original)
+    manifest = {
+        "extension_path": str(extension.path.resolve()),
+        "extension_version": extension.version,
+        "bundle_relative_path": str(extension.bundle.relative_to(extension.path)),
+        "original_sha256": original_hash,
+        "patched_sha256": patched_hash,
+        "patched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not manifest_path.exists():
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return backup_dir
+
+
+def restore_vscode_extensions(explicit: list[Path] | None = None, all_extensions: bool = False) -> int:
+    targets = _resolve_vscode_targets(explicit, all_extensions, operation="restore")
+    if targets is None:
+        return 1
+    failures = 0
+    restored = 0
+    for extension in targets:
+        result = _restore_vscode_extension(extension)
+        if result:
+            restored += 1
+        else:
+            failures += 1
+    if restored:
+        print("Run 'Developer: Reload Window' in VS Code to load the restored picker.")
+    return 1 if failures else 0
+
+
+def _restore_vscode_extension(extension: VSCodeExtension) -> bool:
+    manifests = []
+    backup_root = RUNTIME_DIR / VSCODE_BACKUP_DIR_NAME
+    for manifest_path in backup_root.glob("*/manifest.json") if backup_root.exists() else []:
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            continue
+        if manifest.get("extension_path") == str(extension.path.resolve()):
+            manifests.append((manifest_path, manifest))
+    if not manifests:
+        print(f"No backup found for {extension.path}.", file=sys.stderr)
+        return False
+    for manifest_path, manifest in sorted(manifests, reverse=True):
+        bundle = extension.path / manifest["bundle_relative_path"]
+        try:
+            current_hash = _file_sha256(bundle)
+        except OSError as exc:
+            print(f"Could not read extension bundle {bundle}: {exc}", file=sys.stderr)
+            return False
+        if current_hash != manifest.get("patched_sha256"):
+            continue
+        backup = manifest_path.parent / "bundle.js"
+        if not backup.exists() or _file_sha256(backup) != manifest.get("original_sha256"):
+            print(f"Backup is incomplete or corrupt: {manifest_path.parent}", file=sys.stderr)
+            return False
+        try:
+            bundle.write_bytes(backup.read_bytes())
+        except OSError as exc:
+            print(f"Could not restore extension bundle {bundle}: {exc}", file=sys.stderr)
+            return False
+        print(f"Restored Codex extension {extension.version}: {extension.path}")
+        return True
+    print(
+        f"Refusing to restore {extension.path}: its bundle no longer matches a recorded patched hash. "
+        "Reinstall the extension or patch the current version instead.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _app_asar_hash(path: Path) -> str:

@@ -9,6 +9,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- `patch-vscode` and `restore-vscode` commands with discovery across VS Code,
+  remote-server, Insiders, and Cursor installs; interactive or explicit
+  multi-target selection; versioned hash-checked backups; idempotent patching;
+  and fail-closed handling for updated or unknown extension bundles.
+
 - `codex-shim doctor`, a read-only local diagnostics command covering Python,
   dependencies, Codex CLI availability, settings, runtime files, daemon health,
   passthrough readiness, proxy loopback bypass, and Codex config wiring with
